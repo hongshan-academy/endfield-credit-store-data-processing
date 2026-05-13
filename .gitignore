@@ -6,4 +6,4 @@ data/*
 
 .mypy_cache
 
-error*
+error*.json

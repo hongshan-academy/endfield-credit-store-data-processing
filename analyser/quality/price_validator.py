@@ -33,9 +33,12 @@ ALLOWED_DISCOUNTS = {0, 25, 50, 75, 95, 99}
 def get_chinese_name(item: Item) -> str:
     return EN_TO_CN.get(item.name, item.name)
 
-def floor_expected(original: int, discount: int) -> int:
+def floor_expected(original: int, discount: Optional[int]) -> int:
     """Floor discounted price for given original and discount (0-100)."""
-    return max(1, round(original * (100 - discount) / 100))
+    if discount is None:
+        return original
+    else:
+        return max(1, math.floor(original * (100 - discount) / 100))
 
 def split_price_candidate(price: int, expected_discounted: int, expected_original: int) -> bool:
     s = str(price)
@@ -73,10 +76,10 @@ def prefix_suffix_match(actual_str: str, target: int) -> bool:
 # ------------------------------------------------------------------
 # Core classification
 # ------------------------------------------------------------------
-def classify_price_detailed(item: Item) -> Tuple[str, str, Optional[float]]:
+def classify_price_detailed(item: Item, max_discount: int) -> Tuple[str, str, Optional[int], Optional[float]]:
     ch_name = get_chinese_name(item)
     if ch_name not in BASE_PRICE:
-        return "other_error", f"Unknown item name: {ch_name}", None
+        return "other_error", f"Unknown item name: {ch_name}", None, None
 
     original = BASE_PRICE[ch_name]
     disc = item.discount_percent
@@ -89,64 +92,85 @@ def classify_price_detailed(item: Item) -> Tuple[str, str, Optional[float]]:
 
     if actual is None:
         if has_discount:
-            return "mismatch_with_discount", f"price None but discount {disc}%", None
-        return "missing_discount", "price None", None
+            return "mismatch_with_discount", f"price None but discount {disc}%", None, None
+        return "missing_discount", "price None", None, None
 
     actual_str = str(actual)
 
     # ---- Discount exists case ----
     if has_discount:
+        if disc > max_discount: # type: ignore[operator]
+            return "discount_non_motonic", f"non-motonic discount: {disc} > {max_discount}", None, None
+
         exp_int = floor_expected(original, disc) # type: ignore[arg-type]
         expected = exp_float(disc) # type: ignore[arg-type]
 
         if abs(actual - exp_int) < 1e-6:
-            return "exact_match", f"exact match (floor)", expected
+            return "exact_match", f"exact match (floor)", disc, expected
         if abs(actual - exp_int) <= 1:
-            return "close_match_pm1", f"numeric close ±1", expected
+            return "close_match_pm1", f"numeric close ±1", disc, expected
         if levenshtein(actual_str, str(exp_int)) <= 1:
-            return "close_match_edit", f"edit distance match", expected
+            return "close_match_edit", f"edit distance match", disc, expected
         if prefix_suffix_match(actual_str, exp_int):
-            return "prefix_suffix_match_exact", f"prefix/suffix match for discount {disc}%", expected
+            return "prefix_suffix_match_exact", f"prefix/suffix match for discount {disc}%", disc, expected
         if actual > 999:
             for cand in (exp_int, exp_int-1, exp_int+1):
                 if cand > 0 and split_price_candidate(actual, cand, original):
-                    return "prefix_suffix_match_pm1", f"concatenated split to {cand}/{original}", expected
-        return "mismatch_with_discount", f"unmatched price {actual} with discount {disc}%", expected
+                    return "prefix_suffix_match_pm1", f"concatenated split to {cand}/{original}", disc, expected
+        return "mismatch_with_discount", f"unmatched price {actual} with discount {disc}%", disc, expected
 
     # ---- Discount is None ----
     # First, check if price is close to original (no discount)
     if actual == original:
-        return "exact_match", "no discount, price equals base price", float(original)
+        return "exact_match", "no discount, price equals base price", 0, float(original)
     if abs(actual - original) <= 1:
-        return "close_match_pm1", f"no discount, price close to base (off by {actual - original})", float(original)
+        return "close_match_pm1", f"no discount, price close to base (off by {actual - original})", 0, float(original)
 
     # Then try to match any allowed discount via prefix/suffix
     for d in ALLOWED_DISCOUNTS:
+        if d > max_discount:
+            continue
+        
         exp_int = floor_expected(original, d)
         if prefix_suffix_match(actual_str, exp_int):
-            return "prefix_suffix_match_exact", f"prefix/suffix matches discount {d}% (expected {exp_int})", exp_float(d)
+            return "prefix_suffix_match_exact", f"prefix/suffix matches discount {d}% (expected {exp_int})", d, exp_float(d)
         # Also try ±1 on expected
         for delta in (-1, 1):
             cand = exp_int + delta
             if cand > 0 and prefix_suffix_match(actual_str, cand):
-                return "prefix_suffix_match_exact", f"prefix/suffix (±1) matches discount {d}% (expected {cand})", exp_float(d)
+                return "prefix_suffix_match_exact", f"prefix/suffix (±1) matches discount {d}% (expected {cand})", d, exp_float(d)
 
     # Implied discount: price itself matches an allowed discount when compared to original
     implied = round(100 - (actual / original) * 100)
-    if implied in ALLOWED_DISCOUNTS:
-        return "implied_match", f"price implies {implied}% off", exp_float(implied)
+    for i in (-1, 0, 1):
+        if (implied + i) in ALLOWED_DISCOUNTS and implied + i <= max_discount:
+            return "implied_match", f"price implies {implied + i}% off", implied + i, exp_float(implied + i)
 
     # Nothing works
-    return "other_error", f"no discount, price {actual} does not match any allowed discount", float(original)
+    return "other_error", f"no discount, price {actual} does not match any allowed discount", None, float(original)
 
 # ------------------------------------------------------------------
 # Validation and reporting
 # ------------------------------------------------------------------
-def validate_prices_detailed(items_with_parent: List[Tuple[Item, ImageRecord]]) -> Dict[str, List]:
+def validate_prices_detailed(records: List[ImageRecord]) -> Dict[str, List]:
     result = defaultdict(list)
-    for item, parent in items_with_parent:
-        cat, reason, exp_float = classify_price_detailed(item)
-        result[cat].append((item, parent, reason, exp_float))
+    for parent in records:
+        items = sorted(parent.items, key=lambda x: (x.row, x.col))
+        in_stock = [item for item in items if not item.sold_out]
+        sold_out = [item for item in items if item.sold_out]
+        
+        max_discount = 100
+        for item in in_stock:
+            cat, reason, discount, exp_float = classify_price_detailed(item, max_discount)
+            result[cat].append((item, parent, reason, discount, exp_float))
+            max_discount = discount if discount is not None else max_discount
+        
+        max_discount = 100
+        for item in sold_out:
+            cat, reason, discount, exp_float = classify_price_detailed(item, max_discount)
+            result[cat].append((item, parent, reason, discount, exp_float))
+            max_discount = discount if discount is not None else max_discount
+            
     return dict(result)
 
 def report_price_validation_detailed(validation_result: Dict[str, List], max_examples: int = 5):
@@ -167,9 +191,9 @@ def report_price_validation_detailed(validation_result: Dict[str, List], max_exa
         if not lst:
             continue
         print(f"\n{cat}: {len(lst)} ({len(lst)/total*100:.1f}%)")
-        for item, parent, reason, exp_float in lst[:max_examples]:
+        for item, parent, reason, discount, exp_float in lst[:max_examples]:
             exp_str = f"{exp_float:.2f}" if exp_float is not None else "N/A"
-            print(f"    {parent.filename} (r{item.row}c{item.col}): {reason} (expected_float={exp_str})")
+            print(f"    {parent.filename} (r{item.row}c{item.col}): {reason} (fixed_discount={discount}, expected_float={exp_str})")
         if len(lst) > max_examples:
             print(f"    ... and {len(lst)-max_examples} more.")
 
@@ -177,9 +201,9 @@ def report_price_validation_detailed(validation_result: Dict[str, List], max_exa
     for cat, lst in validation_result.items():
         if cat not in category_order:
             print(f"\n{cat}: {len(lst)} ({len(lst)/total*100:.1f}%)")
-            for item, parent, reason, exp_float in lst[:max_examples]:
+            for item, parent, reason, discount, exp_float in lst[:max_examples]:
                 exp_str = f"{exp_float:.2f}" if exp_float is not None else "N/A"
-                print(f"    {parent.filename} (r{item.row}c{item.col}): {reason} (expected_float={exp_str})")
+                print(f"    {parent.filename} (r{item.row}c{item.col}): {reason} (fixed_discount={discount}, expected_float={exp_str})")
             if len(lst) > max_examples:
                 print(f"    ... and {len(lst)-max_examples} more.")
 
@@ -221,7 +245,7 @@ def export_validation_errors_to_json(validation_result: Dict[str, List], output_
     for cat, lst in validation_result.items():
         if cat in valid_categories:
             continue
-        for item, parent, reason, exp_float in lst:
+        for item, parent, reason, _, exp_float in lst:
             entry = {
                 "filename": parent.filename,
                 "row": item.row,
@@ -251,7 +275,7 @@ def report_file_level_stats(validation_result: Dict[str, List]):
     matched_items_per_file: defaultdict = defaultdict(int)
 
     for cat, entries in validation_result.items():
-        for item, parent, _, _ in entries:
+        for _, parent, _, _, _ in entries:
             filename = parent.filename
             file_count_by_cat[cat].add(filename)
             if cat in unfixable_cats:

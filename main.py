@@ -31,8 +31,7 @@ def run_price_validation_on_file(file_path: Path):
     """Load a JSON file and run price validation, returning the validation dict and printing report."""
     print(f"\nLoading file for validation: {file_path}")
     records = load_records(file_path)
-    items_with_parent = flatten_items(records)
-    validation = validate_prices_detailed(items_with_parent)
+    validation = validate_prices_detailed(records)
     report_price_validation_detailed(validation)
     report_file_level_stats(validation)
     return validation
@@ -88,7 +87,7 @@ def main():
     # Compute validation once if needed
     validation = None
     if args.price_validation or args.dump_errors or args.fix_price:
-        validation = validate_prices_detailed(items_with_parent) # type: ignore
+        validation = validate_prices_detailed(records)
         if args.price_validation:
             report_price_validation_detailed(validation)
             report_file_level_stats(validation)

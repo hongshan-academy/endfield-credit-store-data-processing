@@ -5,3 +5,5 @@ data/*
 .venv
 
 .mypy_cache
+
+error*

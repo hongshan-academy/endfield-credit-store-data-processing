@@ -21,6 +21,28 @@ from .price_validator import (
 # Categories that should NEVER be fixed (preserve original OCR)
 UNFIXABLE_CATEGORIES = {"missing_discount", "other_error"}
 
+# ------------------------------------------------------------------
+# Cost parameters (adjustable)
+# ------------------------------------------------------------------
+
+# Price matching costs
+COST_PRICE_EXACT = 0.0
+COST_PRICE_OFF_BY_1 = 1.0
+COST_PRICE_EDIT_DISTANCE_LE1 = 1.0
+COST_PRICE_PREFIX_SUFFIX_MATCH = 5.0          # was 0.5, increased to discourage unreasonable changes
+COST_PRICE_SPLIT_CANDIDATE = 0.5
+COST_PRICE_OTHER = lambda diff: min(10.0, diff * 0.5)  # diff = abs(actual - expected)
+COST_PRICE_MISSING = 2.0                      # when actual price is None
+
+# Discount matching costs
+COST_DISCOUNT_EXACT = 0.0
+COST_DISCOUNT_MISMATCH = 1.0
+COST_DISCOUNT_CHANGE_PENALTY = 10.0           # extra penalty when changing discount
+COST_DISCOUNT_MISSING = 0.5                   # when discount is None
+
+# DP parameters
+DP_MAX_99_COUNT = 3
+DP_PENALTY_PER_99 = 1.0
 
 # ------------------------------------------------------------------
 # Candidate cost computation
@@ -36,31 +58,33 @@ def compute_candidate_cost(item: Item, base_price: int, discount: int) -> float:
     # Price matching
     if actual_price is not None:
         if actual_price == expected_price:
-            cost += 0.0
+            cost += COST_PRICE_EXACT
         elif abs(actual_price - expected_price) == 1:
-            cost += 1.0
+            cost += COST_PRICE_OFF_BY_1
         else:
             actual_str = str(actual_price)
             exp_str = str(expected_price)
             if levenshtein(actual_str, exp_str) <= 1:
-                cost += 1.0
+                cost += COST_PRICE_EDIT_DISTANCE_LE1
             elif prefix_suffix_match(actual_str, expected_price):
-                cost += 0.5
+                cost += COST_PRICE_PREFIX_SUFFIX_MATCH
             elif actual_price > 999 and split_price_candidate(actual_price, expected_price, base_price):
-                cost += 0.5
+                cost += COST_PRICE_SPLIT_CANDIDATE
             else:
-                cost += min(10.0, abs(actual_price - expected_price) * 0.5)
+                diff = abs(actual_price - expected_price)
+                cost += COST_PRICE_OTHER(diff)
     else:
-        cost += 2.0
+        cost += COST_PRICE_MISSING
 
     # Discount matching
     if actual_discount is not None:
         if actual_discount == discount:
-            cost += 0.0
+            cost += COST_DISCOUNT_EXACT
         else:
-            cost += 1.0
+            cost += COST_DISCOUNT_MISMATCH
+            cost += COST_DISCOUNT_CHANGE_PENALTY
     else:
-        cost += 0.5
+        cost += COST_DISCOUNT_MISSING
 
     return cost
 
@@ -86,72 +110,188 @@ def get_candidates_with_cost(item: Item, base_price: int) -> List[Tuple[int, flo
 def dp_for_fixable_items(
     items: List[Item],
     base_prices: List[int],
+    first_fixed_discount: Optional[int] = None,
+    max_99_count: int = DP_MAX_99_COUNT,
+    penalty_per_99: float = DP_PENALTY_PER_99,
 ) -> List[int]:
     """
     Run monotonic DP on a sequence of fixable items.
-    Returns a list of chosen discounts (int, always one of ALLOWED_DISCOUNTS).
+    
+    Args:
+        items: List of items
+        base_prices: Corresponding base prices (must be same length)
+        first_fixed_discount: If provided and valid, force first item to this discount.
+        max_99_count: Maximum allowed number of discount=99 in the sequence.
+        penalty_per_99: Additional cost per occurrence of discount=99.
+    
+    Returns:
+        List of chosen discounts (int, allowed discounts).
     """
     n = len(items)
     assert n == len(base_prices)
     if n == 0:
         return []
 
-    candidates_per_item = [get_candidates_with_cost(items[i], base_prices[i]) for i in range(n)]
-    discount_matrix = [[c[0] for c in cand] for cand in candidates_per_item]
-    cost_matrix = [[c[1] for c in cand] for cand in candidates_per_item]
+    # Helper to get candidates, optionally with max discount cap
+    def get_candidates_with_cap(item: Item, base: int, max_disc: Optional[int] = None):
+        cand = []
+        for d in ALLOWED_DISCOUNTS:
+            if max_disc is not None and d > max_disc:
+                continue
+            price = floor_expected(base, d)
+            if price > 0:
+                cost = compute_candidate_cost(item, base, d)
+                cand.append((d, cost))
+        return cand
+
+    # Build candidate lists, respecting first_fixed_discount if given
+    fixed_valid = (first_fixed_discount is not None and 
+                   first_fixed_discount in ALLOWED_DISCOUNTS)
+    if fixed_valid and n >= 1:
+        # First item forced to fixed discount, with zero cost
+        first_price = floor_expected(base_prices[0], first_fixed_discount)
+        if first_price <= 0:
+            # fallback: ignore fixed requirement
+            candidates_per_item: List[List[Tuple[int, float]]] = [
+                get_candidates_with_cap(items[i], base_prices[i], None)
+                for i in range(n)
+            ]
+        else:
+            first_disc = cast(int, first_fixed_discount)
+            first_cand: List[Tuple[int, float]] = [(first_disc, 0.0)]
+            rest_cands: List[List[Tuple[int, float]]] = [
+                get_candidates_with_cap(items[i], base_prices[i], first_disc)
+                for i in range(1, n)
+            ]
+            candidates_per_item = [first_cand] + rest_cands
+    else:
+        candidates_per_item: List[List[Tuple[int, float]]] = [
+            get_candidates_with_cap(items[i], base_prices[i], None)
+            for i in range(n)
+        ]
+
+    discount_matrix: List[List[int]] = [[int(c[0]) for c in cand] for cand in candidates_per_item]
+    base_cost_matrix: List[List[float]] = [[float(c[1]) for c in cand] for cand in candidates_per_item]
     lens = [len(c) for c in candidates_per_item]
 
     INF = 1e9
-    dp = [[INF] * lens[i] for i in range(n)]
-    prev = [[-1] * lens[i] for i in range(n)]
+    max_k = max_99_count + 1
+    # dp[i][j][k] = min total cost for first i+1 items, item i choosing candidate j, with exactly k discounted 99
+    dp = [[[INF] * max_k for _ in range(lens[i])] for i in range(n)]
+    # prev stores (prev_j, prev_k)
+    prev = [[[(-1, -1)] * max_k for _ in range(lens[i])] for i in range(n)]
 
-    # Base case
+    # Base
     for j in range(lens[0]):
-        dp[0][j] = cost_matrix[0][j]
+        disc0 = discount_matrix[0][j]
+        is99 = 1 if disc0 == 99 else 0
+        if is99 <= max_99_count:
+            cost0 = base_cost_matrix[0][j] + (penalty_per_99 if is99 else 0.0)
+            dp[0][j][is99] = cost0
+            # prev stays (-1,-1)
 
     # Transition
     for i in range(1, n):
         for j in range(lens[i]):
-            best_prev = -1
-            best_cost = INF
             cur_disc = discount_matrix[i][j]
-            for k in range(lens[i-1]):
-                if discount_matrix[i-1][k] >= cur_disc:
-                    total = dp[i-1][k] + cost_matrix[i][j]
-                    if total < best_cost:
-                        best_cost = total
-                        best_prev = k
-            if best_prev != -1:
-                dp[i][j] = best_cost
-                prev[i][j] = best_prev
+            cur_is99 = 1 if cur_disc == 99 else 0
+            for prev_k in range(max_k):
+                new_k = prev_k + cur_is99
+                if new_k >= max_k:
+                    continue
+                best_prev_cost = INF
+                best_prev_j = -1
+                for k in range(lens[i-1]):
+                    prev_disc = discount_matrix[i-1][k]
+                    if prev_disc >= cur_disc:
+                        prev_cost = dp[i-1][k][prev_k]
+                        if prev_cost < best_prev_cost:
+                            best_prev_cost = prev_cost
+                            best_prev_j = k
+                if best_prev_j != -1:
+                    total = best_prev_cost + base_cost_matrix[i][j] + (penalty_per_99 if cur_is99 else 0.0)
+                    if total < dp[i][j][new_k]:
+                        dp[i][j][new_k] = total
+                        prev[i][j][new_k] = (best_prev_j, prev_k)
 
-    # Backtrack
-    chosen_discounts: List[int] = [0] * n   # default discount 0
+    # Backtrack: find best final state (any valid k)
+    best_last_cost = INF
+    best_last_j = -1
+    best_last_k = -1
+    for j in range(lens[-1]):
+        for k in range(max_k):
+            if dp[-1][j][k] < best_last_cost:
+                best_last_cost = dp[-1][j][k]
+                best_last_j = j
+                best_last_k = k
 
-    if n == 1:
-        best_last = min(range(lens[0]), key=lambda j: dp[0][j])
-        chosen_discounts[0] = discount_matrix[0][best_last]
+    chosen = [0] * n
+    if best_last_j != -1:
+        j = best_last_j
+        k = best_last_k
+        for i in range(n-1, -1, -1):
+            chosen[i] = discount_matrix[i][j]
+            if i > 0:
+                j, k = prev[i][j][k]
     else:
-        valid_last = [j for j in range(lens[-1]) if dp[-1][j] < INF]
-        if valid_last:
-            best_last = min(valid_last, key=lambda j: dp[-1][j])
-            idx = best_last
-            for i in range(n-1, -1, -1):
-                chosen_discounts[i] = discount_matrix[i][idx]
-                if i > 0:
-                    idx = prev[i][idx]
-        else:
-            # No feasible monotonic path: independent best per item
-            for i in range(n):
-                if candidates_per_item[i]:
-                    best_disc = min(candidates_per_item[i], key=lambda x: x[1])[0]
-                    chosen_discounts[i] = best_disc
-    return chosen_discounts
+        # Fallback: per-item best ignoring 99 count (but still monotonic? simpler: per-item best)
+        for i in range(n):
+            if candidates_per_item[i]:
+                best = cast(int, min(candidates_per_item[i], key=lambda x: x[1])[0])
+                chosen[i] = best
+    return chosen
 
 
 # ------------------------------------------------------------------
 # Main fix function with monotonicity per sold_out group
 # ------------------------------------------------------------------
+def _apply_fixes_to_block(
+    block_indices: List[int],
+    fixable_indices: List[int],
+    chosen_discounts: List[int],
+    items_sorted: List[Item],
+    new_items: List[Item],
+    base_prices: List[Optional[int]],
+    categories: List[str],
+) -> int:
+    """
+    Apply chosen discounts to a contiguous block (prefix or suffix).
+    Returns number of items actually fixed.
+    """
+    discount_map = {fixable_indices[k]: chosen_discounts[k] for k in range(len(fixable_indices))}
+    fixed_count = 0
+    for idx in block_indices:
+        if idx not in discount_map:
+            continue
+        chosen_disc = discount_map[idx]
+        base_price = base_prices[idx]
+        if base_price is None:
+            continue
+        cat = categories[idx]
+        expected_price = floor_expected(base_price, chosen_disc)
+        new_item = new_items[idx]
+        fixed = False
+
+        if cat in ("close_match_pm1", "prefix_suffix_match_pm1"):
+            if new_item.discount_percent != chosen_disc:
+                new_item.discount_percent = chosen_disc
+                fixed = True
+            if new_item.original_price != base_price:
+                new_item.original_price = base_price
+                fixed = True
+        else:
+            if new_item.price != expected_price:
+                new_item.price = expected_price
+                fixed = True
+            if new_item.discount_percent != chosen_disc:
+                new_item.discount_percent = chosen_disc
+                fixed = True
+            if new_item.original_price != base_price:
+                new_item.original_price = base_price
+                fixed = True
+        if fixed:
+            fixed_count += 1
+    return fixed_count
 
 def global_fix_with_monotonicity(records: List[ImageRecord]) -> Tuple[List[ImageRecord], Dict[str, Any]]:
     new_records = []
@@ -159,7 +299,6 @@ def global_fix_with_monotonicity(records: List[ImageRecord]) -> Tuple[List[Image
     fixed_items_total = 0
 
     for rec in records:
-        # Sort items by (row, col)
         items_sorted = sorted(rec.items, key=lambda x: (x.row, x.col))
         n = len(items_sorted)
         if n == 0:
@@ -167,7 +306,7 @@ def global_fix_with_monotonicity(records: List[ImageRecord]) -> Tuple[List[Image
             continue
 
         # Precompute per-item data
-        base_prices: List[Optional[int]] = []      # None for unknown items
+        base_prices: List[Optional[int]] = []
         fixable_flags: List[bool] = []
         categories: List[str] = []
         for item in items_sorted:
@@ -184,69 +323,50 @@ def global_fix_with_monotonicity(records: List[ImageRecord]) -> Tuple[List[Image
             base_prices.append(BASE_PRICE[ch_name])
             by_category[cat] += 1
 
-        # Start with a copy of the original items (we will modify in place)
         new_items = deepcopy(items_sorted)
 
-        # Process non-sold_out and sold_out groups separately
-        for sold_out_flag in (False, True):
-            # Indices of items with this sold_out status
-            indices = [i for i, it in enumerate(items_sorted) if it.sold_out == sold_out_flag]
-            if not indices:
-                continue
+        # Identify trailing contiguous sold_out block
+        trailing_start = n
+        for i in range(n - 1, -1, -1):
+            if items_sorted[i].sold_out:
+                trailing_start = i
+            else:
+                break
 
-            # Among these, collect fixable indices
-            fixable_indices = [idx for idx in indices if fixable_flags[idx]]
-            if not fixable_indices:
-                # No fixable items → nothing to do for this group
-                continue
+        # Prefix indices: [0, trailing_start)   (may be empty)
+        # Suffix indices: [trailing_start, n)   (may be empty)
+        prefix_indices = list(range(trailing_start))
+        suffix_indices = list(range(trailing_start, n))
 
-            # Extract fixable items and their base prices (base_prices[idx] is not None here)
-            fixable_items = [items_sorted[idx] for idx in fixable_indices]
-            fixable_bases = [base_prices[idx] for idx in fixable_indices]
-            # fixable_bases are List[int] because idx is fixable => base_prices[idx] is int
+        # Process prefix block
+        if prefix_indices:
+            fixable_indices = [idx for idx in prefix_indices if fixable_flags[idx]]
+            if fixable_indices:
+                fixable_items = [items_sorted[idx] for idx in fixable_indices]
+                fixable_bases = [base_prices[idx] for idx in fixable_indices]
+                first_orig_disc = fixable_items[0].discount_percent if fixable_items else None
+                chosen_discounts = dp_for_fixable_items(
+                    fixable_items, fixable_bases, first_fixed_discount=first_orig_disc # type: ignore[arg-type]
+                )
+                fixed_items_total += _apply_fixes_to_block(
+                    prefix_indices, fixable_indices, chosen_discounts,
+                    items_sorted, new_items, base_prices, categories
+                )
 
-            # Run DP to get chosen discounts for these fixable items
-            chosen_discounts = dp_for_fixable_items(fixable_items, fixable_bases) # type: ignore[arg-type]
-
-            # Map original index to chosen discount
-            discount_map = {fixable_indices[k]: chosen_discounts[k] for k in range(len(fixable_indices))}
-
-            # Apply fixes to the new_items list
-            for idx in indices:
-                if idx in discount_map:
-                    chosen_disc = discount_map[idx]
-                    base_price = base_prices[idx]
-                    # base_price is not None because idx is fixable
-                    if base_price is None:
-                        continue  # safety
-                    cat = categories[idx]
-                    expected_price = floor_expected(base_price, chosen_disc)
-
-                    new_item = new_items[idx]   # already a deepcopy
-                    fixed = False
-
-                    # Apply changes
-                    if cat in ("close_match_pm1", "prefix_suffix_match_pm1"):
-                        # Keep original price, only update discount and original_price
-                        if new_item.discount_percent != chosen_disc:
-                            new_item.discount_percent = chosen_disc
-                            fixed = True
-                        if new_item.original_price != base_price:
-                            new_item.original_price = base_price
-                            fixed = True
-                    else:
-                        # Normal case: set price, discount, original_price
-                        if new_item.price != expected_price:
-                            new_item.price = expected_price
-                            fixed = True
-                        if new_item.discount_percent != chosen_disc:
-                            new_item.discount_percent = chosen_disc
-                            fixed = True
-                        if new_item.original_price != base_price:
-                            new_item.original_price = base_price
-                            fixed = True
-                    if fixed:
-                        fixed_items_total += 1
+        # Process suffix block (trailing sold_out)
+        if suffix_indices:
+            fixable_indices = [idx for idx in suffix_indices if fixable_flags[idx]]
+            if fixable_indices:
+                fixable_items = [items_sorted[idx] for idx in fixable_indices]
+                fixable_bases = [base_prices[idx] for idx in fixable_indices]
+                first_orig_disc = fixable_items[0].discount_percent if fixable_items else None
+                chosen_discounts = dp_for_fixable_items(
+                    fixable_items, fixable_bases, first_fixed_discount=first_orig_disc # type: ignore[arg-type]
+                )
+                fixed_items_total += _apply_fixes_to_block(
+                    suffix_indices, fixable_indices, chosen_discounts,
+                    items_sorted, new_items, base_prices, categories
+                )
 
         # Rebuild record
         new_rec = ImageRecord(

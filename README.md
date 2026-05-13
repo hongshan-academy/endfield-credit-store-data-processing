@@ -9,10 +9,19 @@
 python main.py results_final.json --fix-price
 
 # 只做价格验证（不修复）
-python main.py results_final.json --price-validation
+python main.py results_fINAL.json --price-validation
 
 # 导出需要关注的错误条目（不含 exact_match 和 close_match_pm1 类别）
 python main.py results_final.json --dump-errors errors.json
+
+# 过滤低质量图像（基于价格分类和物品数量）
+python main.py results_final.json --filter --filter-min-score 7.0
+
+# 先过滤再修复（推荐）
+python main.py results_final.json --filter --fix-price
+
+# 干运行：查看过滤和修复统计，但不写入文件
+python main.py results_final.json --filter --fix-price --dry-run
 ```
 
 **注意**：这里的 `results_final.json` 必须具有和 [madSUNitist/endfield-credit-store-ocr](https://github.com/madSUNitist/endfield-credit-store-ocr) 的输出相同的格式。
@@ -20,10 +29,6 @@ python main.py results_final.json --dump-errors errors.json
 ## 价格验证类别
 
 运行 `--price-validation` 会将每个商品归入以下类别（按优先级从上到下检查，一旦匹配即停止）：
-
- ## 价格验证类别
-
- 运行 `--price-validation` 会将每个商品归入以下类别（按优先级从上到下检查，一旦匹配即停止）：
 
  | 类别 | 含义 | 自动修复 |
  |------|------|----------|
@@ -34,7 +39,7 @@ python main.py results_final.json --dump-errors errors.json
  | `prefix_suffix_match_pm1` | 价格字符串包含期望折扣价 ±1 或拼接匹配 | 是（保留原价） |
  | `implied_match` | 价格本身可反推出合法折扣 | 是 |
  | `mismatch_with_discount` | 有折扣但价格错误 | 是 |
- | `discount_non_monotic` | 折扣违反单调性（仅出现在动态验证中） | 是 |
+ | `discount_non_monotonic` | 折扣违反单调性（仅出现在动态验证中） | 是 |
  | `missing_discount` | 无折扣信息且无价格信息 | 否 |
  | `other_error` | 无法匹配任何规则 | 否 |
 
@@ -69,6 +74,46 @@ python main.py results_final.json --dump-errors errors.json
 
 这一设计保证了修复后的数据在视觉顺序上折扣变化合理，减少了因 OCR 识别错误导致的折扣跳跃。
 
+## 质量过滤（Filter）
+
+使用 `--filter` 可以根据价格验证类别和物品数量对图像进行评分，并丢弃得分低于阈值的低质量记录。
+
+### 评分规则
+
+每个 `ImageRecord` 的总分 = 所有物品得分之和 - 数量惩罚（若物品数 ≠ 10）。
+
+单个物品的得分基于其价格验证类别，归一化到 0~1 范围（允许负分）：
+
+| 类别 | 基础分数 | 归一化得分 |
+|------|----------|------------|
+| `exact_match` / `close_match_pm1` / `concatenated_exact` | 100 | 1.0 |
+| `discount_non_monotonic` | 80 | 0.8 |
+| `close_match_edit` | 70 | 0.7 |
+| `prefix_suffix_match_exact` / `prefix_suffix_match_pm1` | 70 | 0.7 |
+| `implied_match` | 50 | 0.5 |
+| `mismatch_with_discount` | 30 | 0.3 |
+| `missing_discount` / `other_error` | -50 | -0.5 |
+
+**数量惩罚**：物品数不等于 10 时，总分直接减去 **5.0** 分（相当于损失 5 个完美物品的得分）。
+
+默认最低保留总分：`7.0`（即一个记录最多允许损失 3 分，例如一个缺失物品或几个低质量物品）。
+
+### 使用示例
+
+```bash
+# 仅过滤，保存过滤后的结果（需指定输出路径）
+python main.py results_final.json --filter --output filtered.json
+
+# 先过滤再修复，保存修复后的文件
+python main.py results_final.json --filter --fix-price
+
+# 自定义最低总分阈值
+python main.py results_final.json --filter --filter-min-score 5.0 --fix-price
+
+# 干运行：查看统计但不写入任何文件
+python main.py results_final.json --filter --fix-price --dry-run
+```
+
 ## 命令行参数
 
 | 参数 | 说明 |
@@ -80,3 +125,6 @@ python main.py results_final.json --dump-errors errors.json
 | `--items` | 输出物品统计（名称、价格、折扣等） |
 | `--uid` / `--refresh` / `--meta` | 分别输出 UID、刷新次数、OCR 元数据统计 |
 | `--rounding` | 比较 floor / round / ceil 对价格匹配的影响 |
+| `--filter` | 启用质量过滤（在修复前执行） |
+| `--filter-min-score` | 保留记录的最低总分阈值（默认 7.0） |
+| `--dry-run` | 干运行：不写入任何文件，仅打印统计信息（不影响过滤和修复的计算） |

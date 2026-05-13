@@ -21,16 +21,22 @@ python main.py results_final.json --dump-errors errors.json
 
 运行 `--price-validation` 会将每个商品归入以下类别（按优先级从上到下检查，一旦匹配即停止）：
 
-| 类别 | 含义 | 自动修复 |
-|------|------|----------|
-| `exact_match` | 价格与折扣完全匹配 | 否（仅补原价） |
-| `close_match_pm1` | 数值差 ±1，保留原值 | 否（仅补原价） |
-| `close_match_edit` | 编辑距离 1，通常为拼写错误 | 是 |
-| `prefix_suffix_match` | 价格字符串包含期望折扣价 | 是 |
-| `implied_match` | 价格本身可反推出合法折扣 | 是 |
-| `mismatch_with_discount` | 有折扣但价格错误 | 是 |
-| `missing_discount` | 无价格信息 | 否 |
-| `other_error` | 无法匹配任何规则 | 否 |
+ ## 价格验证类别
+
+ 运行 `--price-validation` 会将每个商品归入以下类别（按优先级从上到下检查，一旦匹配即停止）：
+
+ | 类别 | 含义 | 自动修复 |
+ |------|------|----------|
+ | `exact_match` | 价格与折扣完全匹配 | 否（仅补原价） |
+ | `close_match_pm1` | 数值差 ±1，保留原值 | 否（仅补原价） |
+ | `close_match_edit` | 编辑距离 1，通常为拼写错误 | 是（保留原价，仅修正折扣和原价） |
+ | `prefix_suffix_match_exact` | 价格字符串包含期望折扣价（完全匹配） | 是 |
+ | `prefix_suffix_match_pm1` | 价格字符串包含期望折扣价 ±1 或拼接匹配 | 是（保留原价） |
+ | `implied_match` | 价格本身可反推出合法折扣 | 是 |
+ | `mismatch_with_discount` | 有折扣但价格错误 | 是 |
+ | `discount_non_monotic` | 折扣违反单调性（仅出现在动态验证中） | 是 |
+ | `missing_discount` | 无折扣信息且无价格信息 | 否 |
+ | `other_error` | 无法匹配任何规则 | 否 |
 
 **优先级说明**：类别按表格从上到下依次检查，`exact_match` 优先于 `close_match_pm1`，后者优先于 `close_match_edit`，以此类推。因此一个条目只会被归入第一个满足条件的类别。
 
@@ -42,14 +48,26 @@ python main.py results_final.json --dump-errors errors.json
 
 - **`exact_match`**：不修改价格和折扣，仅补全 `original_price`
 - **`close_match_pm1`**：保留原价格和折扣，仅补全 `original_price`
-- **`close_match_edit`**：将价格修正为期望值，并同步修正折扣
-- **`prefix_suffix_match`**：从价格字符串中提取正确的折扣价（如 `35140` → `35`），并补全原价和折扣
+- **`close_match_edit`**：保留原价格，仅修正折扣为合法值并补全 `original_price`
+- **`prefix_suffix_match_exact`**：从价格字符串中提取正确的折扣价（如 `35140` → `35`），并补全原价和折扣
+- **`prefix_suffix_match_pm1`**：保留原价格（±1 或拼接匹配），仅修正折扣为合法值并补全 `original_price`
 - **`implied_match`**：根据价格反推合法折扣，并补全原价
 - **`mismatch_with_discount`**：使用现有折扣重新计算正确价格，并补全原价
 - **`missing_discount`**：无法修复（价格缺失）
 - **`other_error`**：无法修复（无法匹配任何规则）
 
 所有可修复类别在修复后都会补充 `original_price` 为标准原价。
+
+## 单调性约束修复
+
+在 `--fix-price` 模式下，会对每个图像内的商品（按行列排序）**分组强制折扣单调非递增**：
+
+- 售罄商品（`sold_out=true`）和未售罄商品分别独立成组。
+- 每组内所有**可修复**商品（非 `missing_discount` / `other_error`）的折扣必须满足 **前一个折扣 ≥ 当前折扣**（即折扣不会增大，价格不会变得更便宜）。
+- 若原始 OCR 数据违反单调性，算法通过动态规划（DP）选择全局代价最小的合法折扣序列，同时保留原始价格对 `close_match_pm1`、`close_match_edit`、`prefix_suffix_match_pm1` 等类别的影响。
+- 不可修复商品（`missing_discount` / `other_error`）**跳过**，但不打断单调性传递（它们不参与 DP，但可修复商品之间依然保持单调）。
+
+这一设计保证了修复后的数据在视觉顺序上折扣变化合理，减少了因 OCR 识别错误导致的折扣跳跃。
 
 ## 命令行参数
 

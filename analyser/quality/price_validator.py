@@ -100,7 +100,7 @@ def classify_price_detailed(item: Item, max_discount: int) -> Tuple[str, str, Op
     # ---- Discount exists case ----
     if has_discount:
         if disc > max_discount: # type: ignore[operator]
-            return "discount_non_motonic", f"non-motonic discount: {disc} > {max_discount}", None, None
+            return "discount_non_monotonic", f"non-monotonic discount: {disc} > {max_discount}", None, None
 
         exp_int = floor_expected(original, disc) # type: ignore[arg-type]
         expected = exp_float(disc) # type: ignore[arg-type]
@@ -184,7 +184,7 @@ def report_price_validation_detailed(validation_result: Dict[str, List], max_exa
         "exact_match", "close_match_pm1", "close_match_edit", 
         "prefix_suffix_match_exact", "concatenated_exact", "prefix_suffix_match_pm1", 
         "implied_match", "mismatch_with_discount", "missing_discount", 
-        "other_error"
+        "other_error", "discount_non_monotonic", 
     ]
     for cat in category_order:
         lst = validation_result.get(cat, [])

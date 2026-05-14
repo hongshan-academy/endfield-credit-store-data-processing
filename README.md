@@ -20,7 +20,7 @@ python main.py results_final.json --filter --filter-min-score 7.0
 # 先过滤再修复（推荐）
 python main.py results_final.json --filter --fix-price
 
-# 干运行：查看过滤和修复统计，但不写入文件
+# 查看过滤和修复统计，但不写入文件
 python main.py results_final.json --filter --fix-price --dry-run
 ```
 
